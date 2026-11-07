@@ -13,7 +13,8 @@
 
 """Convolution kernels for CPU and GPU targets.
 
-Provides direct (register-tiled) convolution, cuDNN-backed convolution
+Provides direct (register-tiled) and Accelerate-backed CPU convolution,
+cuDNN-backed convolution
 (NVIDIA), MIOpen-backed convolution (AMD), and naive GPU reference kernels
 for 1D, 2D, and 3D convolutions in NHWC/NDHWC layouts.
 """
@@ -22,6 +23,7 @@ from std.collections import Optional
 from std.math import align_down, ceildiv
 from std.math.uutils import udivmod
 from std.memory import ThinAllocation, dealloc
+from std.memory.alloc import alloc
 
 
 from std.os import abort
@@ -128,6 +130,10 @@ from layout import (
 )
 from layout.coord import DynamicCoord
 from linalg.accumulate import _Accumulator
+from linalg.matmul.cpu.apple_accelerate import (
+    apple_matmul,
+    use_apple_accelerate_lib,
+)
 from linalg.utils import partition_work
 from max.runtime.asyncrt import parallelism_level
 from max.runtime.tracing import Trace, TraceLevel, trace_arg
@@ -3482,6 +3488,143 @@ def conv_shape[
     return output_shape
 
 
+# The epilogue accesses output only after GEMM has finished writing the tile.
+@__unsafe_nested_origins_read_only
+def _conv2d_nhwc_matmul[
+    rank: Int,
+    EpilogueFnType: ConvEpilogueFn,
+    //,
+    has_epilogue: Bool,
+    filter_packed: Bool,
+](
+    input: TileTensor[mut=False, address_space=.GENERIC, ...],
+    filter: TileTensor[mut=False, address_space=.GENERIC, ...],
+    output: TileTensor[mut=True, address_space=.GENERIC, ...],
+    shape: ConvShape[rank],
+    epilogue_fn: EpilogueFnType,
+) raises -> Bool:
+    """Runs dense contiguous NHWC convolution through Accelerate.
+
+    Extracts patches in bounded tiles, reusing scratch across tiles and batch
+    elements. Returns False without writing output for unsupported layouts or
+    grouped convolutions, allowing the caller to use direct convolution.
+    """
+    if shape.num_groups != 1 or shape.r() * shape.s() == 1 or shape.c < 8:
+        return False
+    # Flattening the filter and output is valid only for contiguous layouts.
+    var input_stride = 1
+    var output_stride = 1
+    comptime for dim in reversed(range(4)):
+        if (
+            Int(input.dynamic_stride(dim)) != input_stride
+            or Int(output.dynamic_stride(dim)) != output_stride
+        ):
+            return False
+        input_stride *= Int(input.dim[dim]())
+        output_stride *= Int(output.dim[dim]())
+
+    var filter_stride = 1
+    comptime for dim in reversed(range(filter.rank)):
+        if Int(filter.dynamic_stride(dim)) != filter_stride:
+            return False
+        filter_stride *= Int(filter.dim[dim]())
+
+    var k = shape.r() * shape.s() * shape.c
+    var spatial = shape.ho() * shape.wo()
+    if k == 0:
+        return False
+    if spatial == 0 or shape.n == 0 or shape.f == 0:
+        return True
+    # At most 4 MiB of patches, or one patch if it exceeds that limit.
+    var tile_rows = min(spatial, min(1024, max(1, (1024 * 1024) // k)))
+    var weight_size = k * shape.f if filter_packed else 0
+    var storage = alloc[Scalar[input.dtype]](
+        {length = tile_rows * k + weight_size}
+    ).into_managed()
+    comptime simd_size = simd_width_of[input.dtype]()
+    # The allocation and filter both remain alive until the last GEMM finishes.
+    var weight_ptr = filter.ptr.unsafe_bitcast[
+        Scalar[input.dtype]
+    ]().unsafe_origin_cast[ImmUntrackedOrigin]()
+    comptime if filter_packed:
+        var unpacked = storage.unsafe_ptr().unsafe_offset(tile_rows * k)
+        var block_size = Int(filter.dim[filter.rank - 1]())
+        var full_filters = shape.f // block_size * block_size
+        for start in range(0, shape.f, simd_size):
+            var block_start = start // block_size * block_size
+            var width = block_size
+            if start >= full_filters:
+                block_start = start
+                width = simd_size
+            var count = min(simd_size, shape.f - start)
+            for row in range(k):
+                var src = filter.ptr.unsafe_offset(
+                    block_start * k + row * width + start - block_start
+                )
+                var dst = unpacked.unsafe_offset(row * shape.f + start)
+
+                @inline(.always)
+                def copy_filters[size: Int](offset: Int) {imm}:
+                    dst.unsafe_store[width=size](
+                        offset,
+                        src.unsafe_load[width=size](offset).cast[input.dtype](),
+                    )
+
+                vectorize[simd_size](count, copy_filters)
+        weight_ptr = unpacked.as_imm().unsafe_origin_cast[ImmUntrackedOrigin]()
+    var weights = TileTensor(weight_ptr, row_major((k, shape.f)))
+
+    for batch in range(shape.n):
+        for start in range(0, spatial, tile_rows):
+            var rows = min(tile_rows, spatial - start)
+            var patches = TileTensor(storage.unsafe_ptr(), row_major((rows, k)))
+            for row in range(rows):
+                var oh, ow = divmod(start + row, shape.wo())
+                for ky in range(shape.r()):
+                    var iy = (
+                        oh * Int(shape.stride[0])
+                        + ky * Int(shape.dilation[0])
+                        - shape.pad_h_lower()
+                    )
+                    for kx in range(shape.s()):
+                        var ix = (
+                            ow * Int(shape.stride[1])
+                            + kx * Int(shape.dilation[1])
+                            - shape.pad_w_lower()
+                        )
+                        var col = (ky * shape.s() + kx) * shape.c
+                        var in_bounds = (
+                            iy >= 0
+                            and iy < shape.h()
+                            and ix >= 0
+                            and ix < shape.w()
+                        )
+
+                        @inline(.always)
+                        def copy_channels[width: Int](channel: Int) {imm}:
+                            var value = SIMD[input.dtype, width](0)
+                            if in_bounds:
+                                value = input.load[width=width](
+                                    (batch, iy, ix, channel)
+                                )
+                            patches.store[width=width](
+                                (row, col + channel), value
+                            )
+
+                        vectorize[simd_size](shape.c, copy_channels)
+
+            var result = TileTensor(
+                output.ptr.unsafe_offset((batch * spatial + start) * shape.f),
+                row_major((rows, shape.f)),
+            )
+            apple_matmul(result, patches, weights)
+            comptime if has_epilogue:
+                for row in range(rows):
+                    var oh, ow = divmod(start + row, shape.wo())
+                    epilogue_fn(Coord(batch, oh, ow, 0), shape.f)
+    return True
+
+
 # `elementwise_lambda` may read and write `output`, which is safe: it is
 # applied to each output row only after that row has been fully written.
 @__unsafe_nested_origins_read_only
@@ -3508,8 +3651,10 @@ def conv_nhwc_direct[
     elementwise_lambda: EpilogueFnType,
     ctx: Optional[DeviceContext.CPU] = None,
 ) raises:
-    """Runs a direct (register-tiled) NHWC convolution on CPU, dispatching to
-    `ConvDirectNHWC.run` with optional elementwise epilogue fusion.
+    """Runs NHWC convolution on CPU with optional elementwise epilogue fusion.
+
+    Eligible float32 2D convolutions on macOS use patch extraction followed
+    by Accelerate GEMM. Other cases dispatch to `ConvDirectNHWC.run`.
 
     Parameters:
         conv_info_rank: Number of spatial dimensions in the convolution (1,
@@ -3612,6 +3757,24 @@ def conv_nhwc_direct[
                 elementwise_lambda(curr_coords, vec)
 
             vectorize[simd_size](f_size, body)
+
+        comptime if (
+            conv_info_rank == 2
+            and use_apple_accelerate_lib[output_type, input_type, filter_type]()
+        ):
+            # Small-channel convolutions favor the parallel direct kernel.
+            if conv_shape.c >= 32 or parallelism_level(ctx) == 1:
+                if _conv2d_nhwc_matmul[
+                    has_epilogue=has_epilogue_fusion,
+                    filter_packed=filter_packed,
+                ](
+                    input_tt,
+                    filter_tt,
+                    output_tt,
+                    conv_shape,
+                    elementwise_epilogue,
+                ):
+                    return
 
         ConvDirectNHWC[
             input_tt.LayoutType,
